@@ -26,6 +26,8 @@ void CMailBox::FlushCalls()
 	SendCall([]() {}, true);
 }
 
+std::atomic<int> CMailBox::g_waitingSenders = 0;
+
 void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
 {
 	std::future<void> future;
@@ -48,7 +50,9 @@ void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
 
 	if(waitForCompletion)
 	{
+		g_waitingSenders++;
 		future.wait();
+		g_waitingSenders--;
 	}
 }
 

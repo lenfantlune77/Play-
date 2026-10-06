@@ -1,6 +1,7 @@
 #include "Ee_SubSystem.h"
 #include "EeExecutor.h"
 #include "VuExecutor.h"
+#include "Vu0Async.h"
 #include "AppConfig.h"
 #include "StdStreamUtils.h"
 #include "../Ps2Const.h"
@@ -63,6 +64,7 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 
 	//Setup link between EE's VU context and VU0's VU context
 	m_vu0StateChangedConnection = m_vpu0->VuStateChanged.Connect([this](CVpu::VU_STATE newState) { Vu0StateChanged(newState); });
+	Vu0Async_SetContext(&m_VU0, m_vpu0.get());
 
 	m_vu1InterruptTriggeredConnection = m_vpu1->VuInterruptTriggered.Connect(
 	    [this]() {
@@ -239,6 +241,11 @@ int CSubSystem::ExecuteCpu(int quota)
 {
 	m_isIdle = false;
 	int executed = 0;
+	//VU0 may also have been stopped or reset some other way: the EE no longer runs alongside it.
+	if(m_EE.m_State.vu0Async && !m_vpu0->IsVuRunning())
+	{
+		m_EE.m_State.vu0Async = 0;
+	}
 	if(m_EE.m_State.callMsEnabled)
 	{
 		if(m_vpu0->IsVuReady())
@@ -269,6 +276,14 @@ int CSubSystem::ExecuteCpu(int quota)
 				//We are in callMs mode
 				m_vpu0->ExecuteMicroProgram(m_EE.m_State.callMsAddr);
 				m_EE.m_State.nHasException = MIPS_EXCEPTION_NONE;
+				//Not over after its first run: on the console the EE goes on while VU0 works, and
+				//the microprogram may well be waiting for it (Rayman M writes VI6 with CTC2).
+				//Only the COP2 instructions that wait for VU0 will stop the EE from now on.
+				if(m_vpu0->IsVuRunning())
+				{
+					m_EE.m_State.callMsEnabled = 0;
+					m_EE.m_State.vu0Async = 1;
+				}
 			}
 			break;
 		case MIPS_EXCEPTION_IDLE:
@@ -302,6 +317,11 @@ int CSubSystem::ExecuteCpu(int quota)
 bool CSubSystem::IsCpuIdle() const
 {
 	return m_os->IsIdle() || m_isIdle;
+}
+
+bool CSubSystem::IsWaitingForMicroProgram() const
+{
+	return m_EE.m_State.callMsEnabled != 0;
 }
 
 void CSubSystem::CountTicks(int ticks)
@@ -664,6 +684,7 @@ void CSubSystem::Vu0StateChanged(CVpu::VU_STATE newState)
 	{
 		flushPipelines(m_VU0);
 		CopyVuState(m_EE, m_VU0);
+		m_EE.m_State.vu0Async = 0;
 	}
 }
 
@@ -706,6 +727,62 @@ uint32 CSubSystem::Vu1IoPortWriteHandler(uint32 address, uint32 value)
 		break;
 	}
 	return 0;
+}
+
+static CMIPS* g_asyncVu0 = nullptr;
+static CVpu* g_asyncVpu0 = nullptr;
+
+void Vu0Async_SetContext(CMIPS* vu0, CVpu* vpu0)
+{
+	g_asyncVu0 = vu0;
+	g_asyncVpu0 = vpu0;
+}
+
+//Only the registers COP2 transfers reach: vector and integer registers, I and R.
+static void CopyVu0TransferRegisters(CMIPS& dst, const CMIPS& src)
+{
+	memcpy(&dst.m_State.nCOP2, &src.m_State.nCOP2, sizeof(dst.m_State.nCOP2));
+	memcpy(&dst.m_State.nCOP2VI, &src.m_State.nCOP2VI, sizeof(dst.m_State.nCOP2VI));
+	dst.m_State.nCOP2I = src.m_State.nCOP2I;
+	dst.m_State.nCOP2R = src.m_State.nCOP2R;
+}
+
+void Vu0Async_Pull(CMIPS* ee)
+{
+	if(g_asyncVu0) CopyVu0TransferRegisters(*ee, *g_asyncVu0);
+}
+
+void Vu0Async_Push(CMIPS* ee)
+{
+	if(g_asyncVu0) CopyVu0TransferRegisters(*g_asyncVu0, *ee);
+}
+
+void Vu0Async_Signal(CMIPS*)
+{
+	if(!g_asyncVpu0 || !g_asyncVu0) return;
+	if(!g_asyncVpu0->IsVuRunning()) return;
+	//Runs VU0 in small steps until it is back where it was waiting, or has ended.
+	uint32 waitingPc = g_asyncVu0->m_State.nPC;
+	for(unsigned int i = 0; (i < 64) && g_asyncVpu0->IsVuRunning(); i++)
+	{
+		g_asyncVpu0->Execute(256);
+		if(g_asyncVu0->m_State.nPC == waitingPc) break;
+	}
+}
+
+void Vu0Async_Wait(CMIPS* ee)
+{
+	if(!g_asyncVpu0) return;
+	//Same budget as the first run after VCALLMS. A microprogram that still runs after it waits for
+	//something the EE will never do now; the EE goes on rather than freeze, with what VU0 has so far.
+	for(unsigned int i = 0; (i < 100) && g_asyncVpu0->IsVuRunning(); i++)
+	{
+		g_asyncVpu0->Execute(5000);
+	}
+	if(g_asyncVpu0->IsVuRunning())
+	{
+		Vu0Async_Pull(ee);
+	}
 }
 
 void CSubSystem::CopyVuState(CMIPS& dst, const CMIPS& src)

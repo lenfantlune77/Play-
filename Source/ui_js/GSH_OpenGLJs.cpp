@@ -1,13 +1,14 @@
 #include "GSH_OpenGLJs.h"
 
-CGSH_OpenGLJs::CGSH_OpenGLJs(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context)
-    : m_context(context)
+CGSH_OpenGLJs::CGSH_OpenGLJs(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context, bool gsThreaded)
+    : CGSH_OpenGL(gsThreaded)
+    , m_context(context)
 {
 }
 
-CGSH_OpenGL::FactoryFunction CGSH_OpenGLJs::GetFactoryFunction(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context)
+CGSH_OpenGL::FactoryFunction CGSH_OpenGLJs::GetFactoryFunction(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context, bool gsThreaded)
 {
-	return [context]() { return new CGSH_OpenGLJs(context); };
+	return [context, gsThreaded]() { return new CGSH_OpenGLJs(context, gsThreaded); };
 }
 
 void CGSH_OpenGLJs::InitializeImpl()

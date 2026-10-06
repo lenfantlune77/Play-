@@ -901,6 +901,8 @@ public:
 	void SendGSCall(const CMailBox::FunctionType&, bool = false, bool = false);
 
 	void ProcessSingleFrame();
+	//Without a GS thread, the owner runs one queued call at a time, waiting at most this long for one.
+	bool ProcessPendingCall(unsigned int waitMs = 0);
 
 	FlipCompleteEvent OnFlipComplete;
 	NewFrameEvent OnNewFrame;

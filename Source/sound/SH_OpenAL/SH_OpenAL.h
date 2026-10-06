@@ -12,7 +12,8 @@ class CSH_OpenAL : public CSoundHandler
 public:
 	enum
 	{
-		MAX_BUFFERS = 25,
+		// Keep enough queued audio to absorb short lockstep/network stalls.
+		MAX_BUFFERS = 64,
 	};
 
 	CSH_OpenAL();

@@ -30,6 +30,8 @@ namespace Ee
 		void Reset(uint32);
 		int ExecuteCpu(int);
 		bool IsCpuIdle() const;
+		//The EE waits for the VU0 microprogram started by VCALLMS: it executes nothing meanwhile.
+		bool IsWaitingForMicroProgram() const;
 		void CountTicks(int);
 
 		void NotifyVBlankStart();

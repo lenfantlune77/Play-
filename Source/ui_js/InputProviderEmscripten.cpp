@@ -1,5 +1,7 @@
 #include "InputProviderEmscripten.h"
 #include "string_format.h"
+#include <cassert>
+#include <iterator>
 
 constexpr uint32 PROVIDER_ID = 'EmSc';
 
@@ -32,6 +34,16 @@ enum
 	INPUT_KEY_3,
 	INPUT_KEY_8,
 	INPUT_KEY_9,
+};
+
+//Analog axes, driven from JavaScript: left X, left Y, right X, right Y.
+enum
+{
+	INPUT_AXIS_BASE = 0xFE00,
+	INPUT_AXIS_COUNT = 8,
+	INPUT_PAD_BUTTON_BASE = 0xFC00,
+	INPUT_PAD_BUTTON_STRIDE = 32,
+	INPUT_PAD2_BASE = 0xFD00,
 };
 
 uint32 CInputProviderEmscripten::GetId() const
@@ -97,17 +109,160 @@ BINDINGTARGET CInputProviderEmscripten::MakeBindingTarget(const EM_UTF8* code)
 		keyCode = INPUT_KEY_8;
 	else if(!strcmp(code, "Key9"))
 		keyCode = INPUT_KEY_9;
+	else if(!strcmp(code, "Pad2Up"))
+		keyCode = INPUT_PAD2_BASE + 0;
+	else if(!strcmp(code, "Pad2Down"))
+		keyCode = INPUT_PAD2_BASE + 1;
+	else if(!strcmp(code, "Pad2Left"))
+		keyCode = INPUT_PAD2_BASE + 2;
+	else if(!strcmp(code, "Pad2Right"))
+		keyCode = INPUT_PAD2_BASE + 3;
+	else if(!strcmp(code, "Pad2Select"))
+		keyCode = INPUT_PAD2_BASE + 4;
+	else if(!strcmp(code, "Pad2Start"))
+		keyCode = INPUT_PAD2_BASE + 5;
+	else if(!strcmp(code, "Pad2Square"))
+		keyCode = INPUT_PAD2_BASE + 6;
+	else if(!strcmp(code, "Pad2Triangle"))
+		keyCode = INPUT_PAD2_BASE + 7;
+	else if(!strcmp(code, "Pad2Circle"))
+		keyCode = INPUT_PAD2_BASE + 8;
+	else if(!strcmp(code, "Pad2Cross"))
+		keyCode = INPUT_PAD2_BASE + 9;
+	else if(!strcmp(code, "Pad2L1"))
+		keyCode = INPUT_PAD2_BASE + 10;
+	else if(!strcmp(code, "Pad2L2"))
+		keyCode = INPUT_PAD2_BASE + 11;
+	else if(!strcmp(code, "Pad2L3"))
+		keyCode = INPUT_PAD2_BASE + 12;
+	else if(!strcmp(code, "Pad2R1"))
+		keyCode = INPUT_PAD2_BASE + 13;
+	else if(!strcmp(code, "Pad2R2"))
+		keyCode = INPUT_PAD2_BASE + 14;
+	else if(!strcmp(code, "Pad2R3"))
+		keyCode = INPUT_PAD2_BASE + 15;
 	else
 		keyCode = code[0];
 	return BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, keyCode, BINDINGTARGET::KEYTYPE::BUTTON);
 }
 
+BINDINGTARGET CInputProviderEmscripten::MakeAxisTarget(uint32 axis)
+{
+	assert(axis < INPUT_AXIS_COUNT);
+	return BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, INPUT_AXIS_BASE + axis, BINDINGTARGET::KEYTYPE::AXIS);
+}
+
+void CInputProviderEmscripten::OnAxis(uint32 axis, uint32 value)
+{
+	if(axis >= INPUT_AXIS_COUNT) return;
+	if(value > BINDINGTARGET::AXIS_MAX) value = BINDINGTARGET::AXIS_MAX;
+	RecordLiveInput(INPUT_AXIS_BASE + axis, value, true);
+	OnInput(MakeAxisTarget(axis), value);
+}
+
+BINDINGTARGET CInputProviderEmscripten::MakePadButtonTarget(uint32 pad, uint32 button)
+{
+	assert(pad < PAD_COUNT);
+	assert(button < INPUT_PAD_BUTTON_STRIDE);
+	return BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, INPUT_PAD_BUTTON_BASE + (pad * INPUT_PAD_BUTTON_STRIDE) + button, BINDINGTARGET::KEYTYPE::BUTTON);
+}
+
+void CInputProviderEmscripten::SetPadButtons(uint32 pad, uint32 mask)
+{
+	if(pad >= PAD_COUNT) return;
+	uint32 changed = m_padButtons[pad] ^ mask;
+	m_padButtons[pad] = mask;
+	for(uint32 button = 0; button < INPUT_PAD_BUTTON_STRIDE; button++)
+	{
+		if(changed & (1U << button))
+		{
+			OnInput(MakePadButtonTarget(pad, button), (mask >> button) & 1);
+		}
+	}
+}
+
 void CInputProviderEmscripten::OnKeyDown(const EM_UTF8* code)
 {
-	OnInput(MakeBindingTarget(code), 1);
+	const auto target = MakeBindingTarget(code);
+	RecordLiveInput(target.keyId, 1, false);
+	OnInput(target, 1);
 }
 
 void CInputProviderEmscripten::OnKeyUp(const EM_UTF8* code)
 {
-	OnInput(MakeBindingTarget(code), 0);
+	const auto target = MakeBindingTarget(code);
+	RecordLiveInput(target.keyId, 0, false);
+	OnInput(target, 0);
+}
+
+void CInputProviderEmscripten::SetLiveFrameProvider(const std::function<uint64()>& provider)
+{
+	m_liveFrameProvider = provider;
+}
+
+void CInputProviderEmscripten::RecordLiveInput(uint32 keyCode, uint32 value, bool axis)
+{
+	if(!m_liveFrameProvider) return;
+	const auto frame = m_liveFrameProvider() + 1;
+	std::lock_guard<std::mutex> lock(m_queuedInputsMutex);
+	m_inputHistory[frame].push_back({ keyCode, value, axis });
+	while(m_inputHistory.size() > 600) m_inputHistory.erase(m_inputHistory.begin());
+}
+
+void CInputProviderEmscripten::QueueAxis(uint64 frame, uint32 axis, uint32 value)
+{
+	if(axis >= INPUT_AXIS_COUNT) return;
+	std::lock_guard<std::mutex> lock(m_queuedInputsMutex);
+	m_queuedInputs[frame].push_back({ INPUT_AXIS_BASE + axis, value, true });
+}
+
+void CInputProviderEmscripten::QueueButton(uint64 frame, uint32 keyCode, uint32 value)
+{
+	std::lock_guard<std::mutex> lock(m_queuedInputsMutex);
+	m_queuedInputs[frame].push_back({ keyCode, value ? 1U : 0U, false });
+}
+
+void CInputProviderEmscripten::QueueButtonCode(uint64 frame, const EM_UTF8* code, uint32 value)
+{
+	const auto target = MakeBindingTarget(code);
+	QueueButton(frame, target.keyId, value);
+}
+
+void CInputProviderEmscripten::ApplyFrame(uint64 frame)
+{
+	std::vector<QueuedInput> inputs;
+	{
+		std::lock_guard<std::mutex> lock(m_queuedInputsMutex);
+		auto found = m_queuedInputs.find(frame);
+		if(found == m_queuedInputs.end()) return;
+		inputs = std::move(found->second);
+		m_inputHistory[frame] = inputs;
+		while(m_inputHistory.size() > 600) m_inputHistory.erase(m_inputHistory.begin());
+		// Consume the frame as well as all older frames. Keeping the current entry
+		// here made a held remote button get replayed forever.
+		m_queuedInputs.erase(m_queuedInputs.begin(), std::next(found));
+	}
+	for(const auto& input : inputs)
+	{
+		const auto target = BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, input.keyCode,
+		                                 input.axis ? BINDINGTARGET::KEYTYPE::AXIS : BINDINGTARGET::KEYTYPE::BUTTON);
+		OnInput(target, input.value);
+	}
+}
+
+void CInputProviderEmscripten::ReplayFrame(uint64 frame)
+{
+	std::vector<QueuedInput> inputs;
+	{
+		std::lock_guard<std::mutex> lock(m_queuedInputsMutex);
+		auto found = m_inputHistory.find(frame);
+		if(found == m_inputHistory.end()) return;
+		inputs = found->second;
+	}
+	for(const auto& input : inputs)
+	{
+		const auto target = BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, input.keyCode,
+		                                 input.axis ? BINDINGTARGET::KEYTYPE::AXIS : BINDINGTARGET::KEYTYPE::BUTTON);
+		OnInput(target, input.value);
+	}
 }

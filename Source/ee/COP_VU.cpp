@@ -4,6 +4,7 @@
 #include "Log.h"
 #include "../MIPS.h"
 #include "../MemoryUtils.h"
+#include "Vu0Async.h"
 #include "offsetof_def.h"
 #include "Vpu.h"
 
@@ -51,24 +52,70 @@ void CCOP_VU::CompileInstruction(uint32 nAddress, CMipsJitter* codeGen, CMIPS* p
 	m_nImm5 = m_nID;
 	m_nImm15 = (uint16)((m_nOpcode >> 6) & 0x7FFF);
 
+	//While a VU0 microprogram runs alongside the EE (vu0Async), the transfers that do not wait for
+	//it work on the registers VU0 uses: they are fetched before, and handed back after a write.
+	//Vector instructions and the transfers with the interlock bit first let VU0 finish, in place:
+	//leaving the block halfway made the WebAssembly generator emit invalid modules inside loops.
 	switch((m_nOpcode >> 26) & 0x3F)
 	{
 	case 0x12:
 		//COP2
-		((this)->*(m_pOpCop2[(m_nOpcode >> 21) & 0x1F]))();
-		break;
+	{
+		uint32 cop2Op = (m_nOpcode >> 21) & 0x1F;
+		bool isTransfer = (cop2Op == 0x01) || (cop2Op == 0x02) || (cop2Op == 0x05) || (cop2Op == 0x06);
+		bool isVector = (cop2Op >= 0x10);
+		bool interlocks = isTransfer && ((m_nOpcode & 1) != 0);
+		if(isVector || interlocks)
+		{
+			EmitVu0AsyncCall(reinterpret_cast<void*>(&Vu0Async_Wait));
+		}
+		//Whatever still runs on VU0 after the wait (a microprogram may be waiting for this very
+		//write: Rayman M sets VI6 for it), the instruction works on its registers and hands them back.
+		//Vector instructions write VU0 registers too (VIADDI, VIADD...), not only the transfers.
+		bool syncs = isTransfer || isVector;
+		if(syncs)
+		{
+			EmitVu0AsyncCall(reinterpret_cast<void*>(&Vu0Async_Pull));
+		}
+		((this)->*(m_pOpCop2[cop2Op]))();
+		if(syncs)
+		{
+			EmitVu0AsyncCall(reinterpret_cast<void*>(&Vu0Async_Push));
+		}
+		if(cop2Op == 0x06)
+		{
+			//CTC2: VU0 reacts to what the EE just wrote before the EE goes on.
+			EmitVu0AsyncCall(reinterpret_cast<void*>(&Vu0Async_Signal));
+		}
+	}
+	break;
 	case 0x36:
 		//LQC2
+		EmitVu0AsyncCall(reinterpret_cast<void*>(&Vu0Async_Pull));
 		LQC2();
+		EmitVu0AsyncCall(reinterpret_cast<void*>(&Vu0Async_Push));
 		break;
 	case 0x3E:
 		//SQC2
+		EmitVu0AsyncCall(reinterpret_cast<void*>(&Vu0Async_Pull));
 		SQC2();
 		break;
 	default:
 		Illegal();
 		break;
 	}
+}
+
+void CCOP_VU::EmitVu0AsyncCall(void* function)
+{
+	m_codeGen->PushRel(offsetof(CMIPS, m_State.vu0Async));
+	m_codeGen->PushCst(0);
+	m_codeGen->BeginIf(Jitter::CONDITION_NE);
+	{
+		m_codeGen->PushCtx();
+		m_codeGen->Call(function, 1, Jitter::CJitter::RETURN_VALUE_NONE);
+	}
+	m_codeGen->EndIf();
 }
 
 //////////////////////////////////////////////////
@@ -105,7 +152,16 @@ void CCOP_VU::LQC2()
 		}
 		else
 		{
-			m_codeGen->Break();
+			//Used to be a break, which killed the emulation thread as soon as a game loaded a VU
+			//register from anything but plain memory (seen in Rayman M).
+			ComputeMemAccessAddrNoXlat();
+
+			m_codeGen->PushCtx();
+			m_codeGen->PushIdx(1);
+			m_codeGen->PushCst(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+			m_codeGen->Call(reinterpret_cast<void*>(&MemoryUtils_LoadQuadProxy), 3, Jitter::CJitter::RETURN_VALUE_NONE);
+
+			m_codeGen->PullTop();
 		}
 	}
 	m_codeGen->EndIf();
@@ -139,7 +195,15 @@ void CCOP_VU::SQC2()
 		}
 		else
 		{
-			m_codeGen->Break();
+			//Same as LQC2: the store goes through the full 128-bit access instead of a break.
+			ComputeMemAccessAddrNoXlat();
+
+			m_codeGen->PushCtx();
+			m_codeGen->PushCst(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+			m_codeGen->PushIdx(2);
+			m_codeGen->Call(reinterpret_cast<void*>(&MemoryUtils_StoreQuadProxy), 3, Jitter::CJitter::RETURN_VALUE_NONE);
+
+			m_codeGen->PullTop();
 		}
 	}
 	m_codeGen->EndIf();
@@ -319,31 +383,32 @@ void CCOP_VU::CTC2()
 //08
 void CCOP_VU::BC2()
 {
-	//Not implemented
-	//We assume that this is used to check if VU0 is still running
-	//after VCALLMS* is used (used in .hack games)
-	//Also used in Kya: Dark Lineage
-	//Also used in Aikagi
-	//For now, we just make it as if VU0 is not running
-
+	//BC2F and BC2T test whether a VU0 microprogram still runs: used after VCALLMS by .hack, Kya:
+	//Dark Lineage and Aikagi to wait for VU0. It only runs alongside the EE in vu0Async mode.
 	uint32 op = (m_nOpcode >> 16) & 0x03;
 	switch(op)
 	{
 	case 0x00:
-		//BC2F
-		//(running == false) -> Branch
-		m_codeGen->PushCst(0);
+		//BC2F: branch when VU0 does not run
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.vu0Async));
 		m_codeGen->PushCst(0);
 		Branch(Jitter::CONDITION_EQ);
 		break;
 	case 0x01:
-		//BC2T
-		//(running == false) -> Do not branch
+		//BC2T: branch when VU0 runs
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.vu0Async));
+		m_codeGen->PushCst(0);
+		Branch(Jitter::CONDITION_NE);
+		break;
+	case 0x02:
+		//BC2FL
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.vu0Async));
+		m_codeGen->PushCst(0);
+		BranchLikely(Jitter::CONDITION_EQ);
 		break;
 	case 0x03:
 		//BC2TL
-		//(running == false) -> Do not branch
-		m_codeGen->PushCst(0);
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.vu0Async));
 		m_codeGen->PushCst(0);
 		BranchLikely(Jitter::CONDITION_NE);
 		break;

@@ -2198,6 +2198,15 @@ void CGSHandler::SendGSCall(CMailBox::FunctionType&& function)
 	m_mailBox.SendCall(std::move(function));
 }
 
+bool CGSHandler::ProcessPendingCall(unsigned int waitMs)
+{
+	assert(!m_gsThreaded);
+	if(!m_mailBox.IsPending() && (waitMs != 0)) m_mailBox.WaitForCall(waitMs);
+	if(!m_mailBox.IsPending()) return false;
+	m_mailBox.ReceiveCall();
+	return true;
+}
+
 void CGSHandler::ProcessSingleFrame()
 {
 	assert(!m_gsThreaded);

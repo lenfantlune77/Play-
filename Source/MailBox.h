@@ -5,6 +5,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <future>
+#include <atomic>
 
 class CMailBox
 {
@@ -18,6 +19,9 @@ public:
 	void FlushCalls();
 
 	bool IsPending() const;
+
+	//How many threads are waiting right now for a call they sent to be done, all mailboxes together.
+	static std::atomic<int> g_waitingSenders;
 	void ReceiveCall();
 	void WaitForCall();
 	void WaitForCall(unsigned int);

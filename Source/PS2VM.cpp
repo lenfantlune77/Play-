@@ -2,6 +2,7 @@
 #include <exception>
 #include <memory>
 #include <climits>
+#include <cstdint>
 #include <fenv.h>
 #include "FpUtils.h"
 #include "make_unique.h"
@@ -18,6 +19,8 @@
 #include "states/MemoryStateFile.h"
 #include "zip/ZipArchiveWriter.h"
 #include "zip/ZipArchiveReader.h"
+#include "MemStream.h"
+#include "PtrStream.h"
 #include "xml/Node.h"
 #include "xml/Writer.h"
 #include "xml/Parser.h"
@@ -251,6 +254,179 @@ void CPS2VM::ReloadFrameRateLimit()
 
 	m_spuUpdateTicksTotal = (static_cast<int64>(eeFreqScaled) << SPU_UPDATE_TICKS_PRECISION) / (static_cast<int64>(DST_SAMPLE_RATE));
 	m_spuUpdateTicksTotal *= static_cast<int64>(SAMPLES_PER_UPDATE);
+}
+
+void CPS2VM::SetNetplayInputApplyHandler(const std::function<void(uint64)>& handler)
+{
+	m_netplayInputApplyHandler = handler;
+}
+
+void CPS2VM::SetNetplayInputReplayHandler(const std::function<void(uint64)>& handler)
+{
+	m_netplayInputReplayHandler = handler;
+}
+
+void CPS2VM::SetNetplayLockstep(bool enabled)
+{
+	m_netplayLockstep.store(enabled, std::memory_order_release);
+	if(!enabled) m_netplayPermit.store(UINT64_MAX, std::memory_order_release);
+	m_netplayCondition.notify_all();
+}
+
+void CPS2VM::ResetNetplayFrame()
+{
+	m_netplayFrame.store(0, std::memory_order_release);
+	m_netplayPermit.store(0, std::memory_order_release);
+	m_netplayStateHash.store(0, std::memory_order_release);
+	m_netplayCondition.notify_all();
+}
+
+uint64 CPS2VM::GetNetplayFrame() const { return m_netplayFrame.load(std::memory_order_acquire); }
+
+void CPS2VM::AdvanceNetplayFrame(uint64 frame)
+{
+	auto current = m_netplayPermit.load(std::memory_order_relaxed);
+	while(frame > current && !m_netplayPermit.compare_exchange_weak(current, frame, std::memory_order_release)) {}
+	m_netplayCondition.notify_all();
+}
+
+uint64 CPS2VM::GetNetplayStateHash() const { return m_netplayStateHash.load(std::memory_order_acquire); }
+bool CPS2VM::SaveNetplayState(const fs::path& path) { return SaveState(path).get(); }
+bool CPS2VM::LoadNetplayState(const fs::path& path) { return LoadState(path).get(); }
+
+bool CPS2VM::CaptureNetplaySnapshot()
+{
+	if(!m_ee || !m_ee->m_gs) return false;
+	try
+	{
+		Framework::CMemStream stream;
+		Framework::CZipArchiveWriter archive;
+		m_ee->SaveState(archive);
+		m_iop->SaveState(archive);
+		m_ee->m_gs->SaveState(archive);
+		SaveVmTimingState(archive);
+		archive.Write(stream);
+		m_netplaySnapshot.assign(stream.GetBuffer(), stream.GetBuffer() + stream.GetSize());
+		const auto frame = m_netplayFrame.load(std::memory_order_acquire);
+		m_netplaySnapshotFrame.store(frame, std::memory_order_release);
+		if(m_netplayLockstep.load(std::memory_order_acquire))
+		{
+			m_netplaySnapshots.push_back({ frame, m_netplaySnapshot });
+			while(m_netplaySnapshots.size() > 4) m_netplaySnapshots.pop_front();
+		}
+		return true;
+	}
+	catch(...)
+	{
+		m_netplaySnapshot.clear();
+		return false;
+	}
+}
+
+bool CPS2VM::RestoreNetplaySnapshot()
+{
+	if(!m_ee || !m_ee->m_gs || m_netplaySnapshot.empty()) return false;
+	try
+	{
+		Framework::CPtrStream stream(m_netplaySnapshot.data(), m_netplaySnapshot.size());
+		Framework::CZipArchiveReader archive(stream);
+		m_ee->LoadState(archive);
+		m_iop->LoadState(archive);
+		m_ee->m_gs->LoadState(archive);
+		LoadVmTimingState(archive);
+		m_netplayFrame.store(m_netplaySnapshotFrame.load(std::memory_order_acquire), std::memory_order_release);
+		ReloadFrameRateLimit();
+		OnMachineStateChange();
+		return true;
+	}
+	catch(...)
+	{
+		return false;
+	}
+}
+
+uint64 CPS2VM::GetNetplaySnapshotFrame() const
+{
+	return m_netplaySnapshotFrame.load(std::memory_order_acquire);
+}
+
+std::vector<uint8> CPS2VM::GetNetplaySnapshot() const
+{
+	return m_netplaySnapshot;
+}
+
+void CPS2VM::SetNetplaySnapshot(const std::vector<uint8>& bytes, uint64 frame)
+{
+	m_netplaySnapshot = bytes;
+	m_netplaySnapshotFrame.store(frame, std::memory_order_release);
+}
+
+bool CPS2VM::RollbackNetplayFrame(uint64 frame)
+{
+	for(auto it = m_netplaySnapshots.rbegin(); it != m_netplaySnapshots.rend(); ++it)
+	{
+		if(it->frame > frame) continue;
+		m_netplaySnapshot = it->bytes;
+		m_netplaySnapshotFrame.store(it->frame, std::memory_order_release);
+		return RestoreNetplaySnapshot();
+	}
+	return false;
+}
+
+void CPS2VM::ReplayNetplayFrames(uint64 targetFrame)
+{
+	const auto startFrame = m_netplaySnapshotFrame.load(std::memory_order_acquire);
+	if(m_netplayInputReplayHandler && targetFrame > startFrame)
+	{
+		for(uint64 frame = startFrame + 1; frame <= targetFrame; frame++)
+		{
+			m_netplayInputReplayHandler(frame);
+		}
+	}
+	m_netplayFrame.store(targetFrame, std::memory_order_release);
+	m_netplayLockstep.store(true, std::memory_order_release);
+	m_netplayPermit.store(targetFrame, std::memory_order_release);
+	m_netplayCondition.notify_all();
+}
+
+void CPS2VM::WaitForNetplayFrame(uint64 frame)
+{
+	if(!m_netplayLockstep.load(std::memory_order_acquire)) return;
+	std::unique_lock<std::mutex> lock(m_netplayMutex);
+	m_netplayCondition.wait(lock, [this, frame]() {
+		return !m_netplayLockstep.load(std::memory_order_acquire) ||
+		       m_netplayPermit.load(std::memory_order_acquire) >= frame || m_nEnd;
+	});
+}
+
+static uint64 HashNetplayBytes(uint64 hash, const uint8* data, size_t size)
+{
+	// Hash a deterministic sample each frame. A complete 188 MiB memory scan here would
+	// consume the whole frame budget on phones and would make lockstep less usable than the game.
+	for(size_t i = 0; i < size; i += 4096) { hash ^= data[i]; hash *= 1099511628211ULL; }
+	return hash;
+}
+
+uint64 CPS2VM::ComputeNetplayStateHash() const
+{
+	uint64 hash = 1469598103934665603ULL;
+	if(m_ee)
+	{
+		hash = HashNetplayBytes(hash, m_ee->m_ram, m_eeRamSize);
+		hash = HashNetplayBytes(hash, m_ee->m_vuMem0, PS2::VUMEM0SIZE);
+		hash = HashNetplayBytes(hash, m_ee->m_vuMem1, PS2::VUMEM1SIZE);
+		hash = HashNetplayBytes(hash, m_ee->m_microMem0, PS2::MICROMEM0SIZE);
+		hash = HashNetplayBytes(hash, m_ee->m_microMem1, PS2::MICROMEM1SIZE);
+		hash = HashNetplayBytes(hash, reinterpret_cast<const uint8*>(&m_ee->m_EE.m_State), sizeof(m_ee->m_EE.m_State));
+		hash = HashNetplayBytes(hash, reinterpret_cast<const uint8*>(&m_ee->m_VU0.m_State), sizeof(m_ee->m_VU0.m_State));
+		hash = HashNetplayBytes(hash, reinterpret_cast<const uint8*>(&m_ee->m_VU1.m_State), sizeof(m_ee->m_VU1.m_State));
+	}
+	if(m_iop)
+	{
+		hash = HashNetplayBytes(hash, m_iop->m_ram, m_iopRamSize);
+		hash = HashNetplayBytes(hash, reinterpret_cast<const uint8*>(&m_iop->m_cpu.m_State), sizeof(m_iop->m_cpu.m_State));
+	}
+	return hash;
 }
 
 CVirtualMachine::STATUS CPS2VM::GetStatus() const
@@ -722,7 +898,10 @@ void CPS2VM::UpdateEe()
 	while(m_eeExecutionTicks > 0)
 	{
 		int executed = m_ee->ExecuteCpu(m_singleStepEe ? 1 : m_eeExecutionTicks);
-		if(m_ee->IsCpuIdle())
+		//While the EE waits for a VU0 microprogram, time goes on as it does on the console: VU0 and
+		//VU1 get a real quota, and timers, DMA and interrupts move. Counting nothing here kept this
+		//loop going forever whenever the microprogram needed more time than its first run (Rayman M).
+		if(m_ee->IsCpuIdle() || m_ee->IsWaitingForMicroProgram())
 		{
 			m_cpuUtilisation.eeIdleTicks += (m_eeExecutionTicks - executed);
 			executed = m_eeExecutionTicks;
@@ -911,10 +1090,13 @@ void CPS2VM::EmuThread()
 	m_frameLimiter.BeginFrame();
 	while(1)
 	{
+		m_emuLoops++;
+		m_emuStep = EMU_STEP_MAILBOX;
 		while(m_mailBox.IsPending())
 		{
 			m_mailBox.ReceiveCall();
 		}
+		m_emuStep = EMU_STEP_LOOP;
 		if(m_nEnd) break;
 		if(m_nStatus == PAUSED)
 		{
@@ -924,7 +1106,9 @@ void CPS2VM::EmuThread()
 		{
 			if(m_spuUpdateTicks <= 0)
 			{
+				m_emuStep = EMU_STEP_SPU;
 				UpdateSpu();
+				m_emuStep = EMU_STEP_LOOP;
 				m_spuUpdateTicks += m_spuUpdateTicksTotal;
 			}
 
@@ -944,6 +1128,7 @@ void CPS2VM::EmuThread()
 					m_inVblank = !m_inVblank;
 					if(m_inVblank)
 					{
+						m_emuStep = EMU_STEP_VBLANK_START;
 						m_vblankTicks += m_vblankTicksTotal;
 						m_ee->NotifyVBlankStart();
 						m_iop->NotifyVBlankStart();
@@ -958,6 +1143,7 @@ void CPS2VM::EmuThread()
 
 						if(m_pad != NULL)
 						{
+							if(m_netplayInputApplyHandler) m_netplayInputApplyHandler(m_netplayFrame.load(std::memory_order_acquire) + 1);
 							m_pad->Update(m_ee->m_ram);
 						}
 #ifdef PROFILE
@@ -965,6 +1151,12 @@ void CPS2VM::EmuThread()
 						CProfiler::GetInstance().CountCurrentZone();
 #endif
 						OnNewFrame();
+						const auto frame = m_netplayFrame.fetch_add(1, std::memory_order_acq_rel) + 1;
+						if((frame % 120) == 0)
+						{
+							m_netplayStateHash.store(ComputeNetplayStateHash(), std::memory_order_release);
+						}
+		WaitForNetplayFrame(frame);
 #ifdef PROFILE
 						CProfiler::GetInstance().Reset();
 #endif
@@ -972,6 +1164,7 @@ void CPS2VM::EmuThread()
 					}
 					else
 					{
+						m_emuStep = EMU_STEP_VBLANK_END;
 						m_vblankTicks += m_onScreenTicksTotal;
 						m_ee->NotifyVBlankEnd();
 						m_iop->NotifyVBlankEnd();
@@ -987,8 +1180,11 @@ void CPS2VM::EmuThread()
 				m_eeExecutionTicks += m_eeTickStep;
 				m_iopExecutionTicks += m_iopTickStep;
 
+				m_emuStep = EMU_STEP_EE;
 				UpdateEe();
+				m_emuStep = EMU_STEP_IOP;
 				UpdateIop();
+				m_emuStep = EMU_STEP_LOOP;
 			}
 #ifdef DEBUGGER_INCLUDED
 			if(

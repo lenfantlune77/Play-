@@ -58,6 +58,9 @@ protected:
 	static InstructionFuncConstant m_pOpVx3[0x20];
 
 private:
+	//A VU0 microprogram may run alongside the EE: these emit what COP2 instructions do then.
+	void EmitVu0AsyncCall(void*);
+
 	//General
 	void LQC2();
 	void SQC2();

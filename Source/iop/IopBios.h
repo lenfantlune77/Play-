@@ -178,6 +178,9 @@ public:
 	int32 SearchModuleByName(const char*) const;
 	int32 ReferModuleStatus(uint32, uint32);
 	void ProcessModuleReset(const std::string&);
+	//One line per IOP thread (id, state, what it waits for, where it stands), for the page to tell
+	//what the IOP waits for when a game hangs. Available without the debugger.
+	std::string GetThreadsSummary();
 
 	void SetDefaultImageVersion(uint32);
 	bool TryGetImageVersionFromPath(const std::string&, unsigned int*);

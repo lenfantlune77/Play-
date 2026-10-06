@@ -2,6 +2,11 @@
 
 #include <thread>
 #include <future>
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+#include <deque>
+#include <atomic>
 #include "filesystem_def.h"
 #include "Types.h"
 #include "MIPS.h"
@@ -70,6 +75,24 @@ public:
 
 	void SetEeFrequencyScale(uint32, uint32);
 	void ReloadFrameRateLimit();
+	void SetNetplayInputApplyHandler(const std::function<void(uint64)>& handler);
+	void SetNetplayInputReplayHandler(const std::function<void(uint64)>& handler);
+
+	// Deterministic frame gate used by the browser two-core local multiplayer mode.
+	void SetNetplayLockstep(bool enabled);
+	void ResetNetplayFrame();
+	uint64 GetNetplayFrame() const;
+	void AdvanceNetplayFrame(uint64 frame);
+	uint64 GetNetplayStateHash() const;
+	bool SaveNetplayState(const fs::path&);
+	bool LoadNetplayState(const fs::path&);
+	bool CaptureNetplaySnapshot();
+	bool RestoreNetplaySnapshot();
+	uint64 GetNetplaySnapshotFrame() const;
+	std::vector<uint8> GetNetplaySnapshot() const;
+	void SetNetplaySnapshot(const std::vector<uint8>&, uint64 frame);
+	bool RollbackNetplayFrame(uint64 frame);
+	void ReplayNetplayFrames(uint64 targetFrame);
 
 	static fs::path GetStateDirectoryPath();
 	fs::path GenerateStatePath(unsigned int) const;
@@ -99,6 +122,37 @@ public:
 
 	EeSubSystemPtr m_ee;
 	IopSubSystemPtr m_iop;
+
+	//Read from another thread when a game stops drawing: how many times the emulation loop went
+	//round, and which step it is in. A count that stands still means the loop is stuck in that step.
+	enum EMU_STEP : uint32
+	{
+		EMU_STEP_LOOP,
+		EMU_STEP_MAILBOX,
+		EMU_STEP_SPU,
+		EMU_STEP_VBLANK_START,
+		EMU_STEP_VBLANK_END,
+		EMU_STEP_EE,
+		EMU_STEP_IOP,
+	};
+	std::atomic<uint32> m_emuLoops = 0;
+	std::atomic<uint32> m_emuStep = EMU_STEP_LOOP;
+	std::atomic<bool> m_netplayLockstep = false;
+	std::atomic<uint64> m_netplayFrame = 0;
+	std::atomic<uint64> m_netplayPermit = 0;
+	std::atomic<uint64> m_netplayStateHash = 0;
+	std::vector<uint8> m_netplaySnapshot;
+	std::atomic<uint64> m_netplaySnapshotFrame = 0;
+	struct NetplaySnapshotEntry
+	{
+		uint64 frame = 0;
+		std::vector<uint8> bytes;
+	};
+	std::deque<NetplaySnapshotEntry> m_netplaySnapshots;
+	mutable std::mutex m_netplayMutex;
+	std::condition_variable m_netplayCondition;
+	std::function<void(uint64)> m_netplayInputApplyHandler;
+	std::function<void(uint64)> m_netplayInputReplayHandler;
 
 	NewFrameEvent OnNewFrame;
 
@@ -149,6 +203,8 @@ private:
 	void RegisterModulesInPadHandler();
 
 	void EmuThread();
+	void WaitForNetplayFrame(uint64 frame);
+	uint64 ComputeNetplayStateHash() const;
 
 	std::thread m_thread;
 	STATUS m_nStatus = PAUSED;

@@ -118,6 +118,8 @@ struct MIPSSTATE
 	uint32 cmsar0;
 	uint32 callMsEnabled;
 	uint32 callMsAddr;
+	//A VU0 microprogram started by VCALLMS still runs while the EE goes on.
+	uint32 vu0Async;
 
 	uint32 savedIntReg;
 	uint32 savedIntRegTemp;

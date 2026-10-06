@@ -227,9 +227,33 @@ static DiskUtils::OpticalMediaPtr CreateOpticalMediaFromChd(const fs::path& imag
 	return result;
 }
 
+static DiskUtils::OpticalMediaPtr CreateOpticalMediaFromBin(
+    const std::shared_ptr<Framework::CStream>& imageStream, uint32 opticalMediaCreateFlags)
+{
+	// Some .bin dumps contain raw Mode 1 sectors (2352 bytes, with a 16-byte
+	// sector header). Try that layout before the generic 2048/Mode 2 detection.
+	if((imageStream->GetLength() % COpticalMedia::MEDIA_BLOCK_SIZE_2352) == 0)
+	{
+		try
+		{
+			auto blockProvider = std::make_shared<ISO9660::CBlockProviderCustom<
+			    COpticalMedia::MEDIA_BLOCK_SIZE_2352, COpticalMedia::MEDIA_BLOCK_SIZE_2352, 0x10>>(imageStream);
+			COpticalMedia::TRACK track = {};
+			track.size = blockProvider->GetBlockCount();
+			return COpticalMedia::CreateCustom(
+			    blockProvider, COpticalMedia::MEDIA_BLOCK_TYPE_2352, {track});
+		}
+		catch(...)
+		{
+			// It may instead be a cooked ISO or a Mode 2/XA CD image.
+		}
+	}
+	return COpticalMedia::CreateAuto(imageStream, opticalMediaCreateFlags);
+}
+
 const DiskUtils::ExtensionList& DiskUtils::GetSupportedExtensions()
 {
-	static auto extensionList = ExtensionList{".iso", ".mds", ".isz", ".cso", ".cue", ".chd"};
+	static auto extensionList = ExtensionList{".iso", ".bin", ".mds", ".isz", ".cso", ".cue", ".chd"};
 	return extensionList;
 }
 
@@ -285,6 +309,10 @@ DiskUtils::OpticalMediaPtr DiskUtils::CreateOpticalMediaFromPath(const fs::path&
 	if(!stream)
 	{
 		stream = std::shared_ptr<Framework::CStream>(CreateImageStream(imagePath));
+	}
+	if(!stricmp(extension.c_str(), ".bin"))
+	{
+		return CreateOpticalMediaFromBin(stream, opticalMediaCreateFlags);
 	}
 
 	return COpticalMedia::CreateAuto(stream, opticalMediaCreateFlags);

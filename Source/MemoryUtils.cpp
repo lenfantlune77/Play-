@@ -5,26 +5,49 @@
 
 #define LOG_NAME "MemoryMap"
 
+std::atomic<uint32> g_memoryProxyAccess = 0;
+
+namespace
+{
+	//Marks an access for as long as it lasts, and restores the outer one for nested accesses.
+	struct CProxyAccess
+	{
+		CProxyAccess(uint32 vAddress, bool write)
+		    : m_previous(g_memoryProxyAccess.exchange((vAddress & ~1U) | (write ? 1 : 0)))
+		{
+		}
+		~CProxyAccess()
+		{
+			g_memoryProxyAccess = m_previous;
+		}
+		uint32 m_previous;
+	};
+}
+
 uint32 MemoryUtils_GetByteProxy(CMIPS* context, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, false);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	return static_cast<uint32>(context->m_pMemoryMap->GetByte(address));
 }
 
 uint32 MemoryUtils_GetHalfProxy(CMIPS* context, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, false);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	return static_cast<uint32>(context->m_pMemoryMap->GetHalf(address));
 }
 
 uint32 MemoryUtils_GetWordProxy(CMIPS* context, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, false);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	return context->m_pMemoryMap->GetWord(address);
 }
 
 uint64 MemoryUtils_GetDoubleProxy(CMIPS* context, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, false);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	assert((address & 0x07) == 0);
 	auto e = context->m_pMemoryMap->GetReadMap(address);
@@ -55,6 +78,7 @@ uint64 MemoryUtils_GetDoubleProxy(CMIPS* context, uint32 vAddress)
 
 uint128 MemoryUtils_GetQuadProxy(CMIPS* context, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, false);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	address &= ~0x0F;
 	auto e = context->m_pMemoryMap->GetReadMap(address);
@@ -85,24 +109,28 @@ uint128 MemoryUtils_GetQuadProxy(CMIPS* context, uint32 vAddress)
 
 void MemoryUtils_SetByteProxy(CMIPS* context, uint32 value, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, true);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	context->m_pMemoryMap->SetByte(address, static_cast<uint8>(value));
 }
 
 void MemoryUtils_SetHalfProxy(CMIPS* context, uint32 value, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, true);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	context->m_pMemoryMap->SetHalf(address, static_cast<uint16>(value));
 }
 
 void MemoryUtils_SetWordProxy(CMIPS* context, uint32 value, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, true);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	context->m_pMemoryMap->SetWord(address, value);
 }
 
 void MemoryUtils_SetDoubleProxy(CMIPS* context, uint64 value64, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, true);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	assert((address & 0x07) == 0);
 	INTEGER64 value;
@@ -133,6 +161,7 @@ void MemoryUtils_SetDoubleProxy(CMIPS* context, uint64 value64, uint32 vAddress)
 
 void MemoryUtils_SetQuadProxy(CMIPS* context, const uint128& value, uint32 vAddress)
 {
+	CProxyAccess access(vAddress, true);
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	address &= ~0x0F;
 	auto e = context->m_pMemoryMap->GetWriteMap(address);
@@ -157,4 +186,16 @@ void MemoryUtils_SetQuadProxy(CMIPS* context, const uint128& value, uint32 vAddr
 		assert(0);
 		break;
 	}
+}
+
+void MemoryUtils_LoadQuadProxy(CMIPS* context, uint32 vAddress, uint32 registerOffset)
+{
+	auto target = reinterpret_cast<uint128*>(reinterpret_cast<uint8*>(context) + registerOffset);
+	*target = MemoryUtils_GetQuadProxy(context, vAddress);
+}
+
+void MemoryUtils_StoreQuadProxy(CMIPS* context, uint32 registerOffset, uint32 vAddress)
+{
+	auto source = reinterpret_cast<const uint128*>(reinterpret_cast<const uint8*>(context) + registerOffset);
+	MemoryUtils_SetQuadProxy(context, *source, vAddress);
 }

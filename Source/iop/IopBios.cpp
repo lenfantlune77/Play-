@@ -3130,6 +3130,36 @@ uint32 CIopBios::AssembleReturnFromException(CMIPSAssembler& assembler)
 	return address;
 }
 
+std::string CIopBios::GetThreadsSummary()
+{
+	std::string summary;
+	for(auto it = std::begin(m_threads); it != std::end(m_threads); it++)
+	{
+		auto thread = *it;
+		if(!thread) continue;
+		const char* state = "?";
+		switch(thread->status)
+		{
+		case THREAD_STATUS_DORMANT: state = "dormant"; break;
+		case THREAD_STATUS_RUNNING: state = "pret"; break;
+		case THREAD_STATUS_SLEEPING: state = "endormi"; break;
+		case THREAD_STATUS_WAITING_SEMAPHORE: state = "semaphore"; break;
+		case THREAD_STATUS_WAITING_EVENTFLAG: state = "drapeau"; break;
+		case THREAD_STATUS_WAITING_MESSAGEBOX: state = "boite"; break;
+		case THREAD_STATUS_WAITING_FPL: state = "fpl"; break;
+		case THREAD_STATUS_WAIT_VBLANK_START: state = "vblank"; break;
+		case THREAD_STATUS_WAIT_VBLANK_END: state = "finvblank"; break;
+		default: break;
+		}
+		uint32 pc = (m_currentThreadId == it) ? m_cpu.m_State.nPC : thread->context.epc;
+		uint32 ra = (m_currentThreadId == it) ? m_cpu.m_State.nGPR[CMIPS::RA].nV0 : thread->context.gpr[CMIPS::RA];
+		char line[96];
+		snprintf(line, sizeof(line), " %u:%s/%u@%08X<%08X", static_cast<uint32>(it), state, thread->waitObjectId, pc, ra);
+		summary += line;
+	}
+	return summary;
+}
+
 uint32 CIopBios::AssembleIdleFunction(CMIPSAssembler& assembler)
 {
 	uint32 address = BIOS_HANDLERS_BASE + assembler.GetProgramSize() * 4;
