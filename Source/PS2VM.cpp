@@ -269,7 +269,16 @@ void CPS2VM::SetNetplayInputReplayHandler(const std::function<void(uint64)>& han
 void CPS2VM::SetNetplayLockstep(bool enabled)
 {
 	m_netplayLockstep.store(enabled, std::memory_order_release);
-	if(!enabled) m_netplayPermit.store(UINT64_MAX, std::memory_order_release);
+	// Entering lockstep must revoke the unlimited permit left by free-running mode.
+	// Otherwise WaitForNetplayFrame sees UINT64_MAX and never waits for the peer.
+	if(enabled)
+	{
+		m_netplayPermit.store(m_netplayFrame.load(std::memory_order_acquire), std::memory_order_release);
+	}
+	else
+	{
+		m_netplayPermit.store(UINT64_MAX, std::memory_order_release);
+	}
 	m_netplayCondition.notify_all();
 }
 
