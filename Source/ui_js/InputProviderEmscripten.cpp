@@ -41,8 +41,6 @@ enum
 {
 	INPUT_AXIS_BASE = 0xFE00,
 	INPUT_AXIS_COUNT = 8,
-	INPUT_PAD_BUTTON_BASE = 0xFC00,
-	INPUT_PAD_BUTTON_STRIDE = 32,
 	INPUT_PAD2_BASE = 0xFD00,
 };
 
@@ -163,8 +161,9 @@ void CInputProviderEmscripten::OnAxis(uint32 axis, uint32 value)
 BINDINGTARGET CInputProviderEmscripten::MakePadButtonTarget(uint32 pad, uint32 button)
 {
 	assert(pad < PAD_COUNT);
-	assert(button < INPUT_PAD_BUTTON_STRIDE);
-	return BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, INPUT_PAD_BUTTON_BASE + (pad * INPUT_PAD_BUTTON_STRIDE) + button, BINDINGTARGET::KEYTYPE::BUTTON);
+	assert(button >= 4 && button < 20);
+	// Keep whole-pad button updates on the same key IDs as the Pad2 bindings below.
+	return BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, INPUT_PAD2_BASE + (button - 4), BINDINGTARGET::KEYTYPE::BUTTON);
 }
 
 void CInputProviderEmscripten::SetPadButtons(uint32 pad, uint32 mask)
@@ -172,7 +171,7 @@ void CInputProviderEmscripten::SetPadButtons(uint32 pad, uint32 mask)
 	if(pad >= PAD_COUNT) return;
 	uint32 changed = m_padButtons[pad] ^ mask;
 	m_padButtons[pad] = mask;
-	for(uint32 button = 0; button < INPUT_PAD_BUTTON_STRIDE; button++)
+	for(uint32 button = 4; button < 20; button++)
 	{
 		if(changed & (1U << button))
 		{
